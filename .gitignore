@@ -13,3 +13,5 @@ __pycache__/
 .yarn-cache/
 *.pyc
 *.pyo
+data/
+interlock-data/

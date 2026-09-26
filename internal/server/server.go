@@ -38,6 +38,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
+	// After a persistence failure the process can no longer guarantee that
+	// an acknowledged state is durable; report unhealthy so the container
+	// supervisor restarts it and the WAL recovery takes over.
+	if !s.eng.Healthy() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "unavailable",
+			"reason": "persistence failure; restart required to recover",
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -123,6 +133,8 @@ func writeEngineErr(w http.ResponseWriter, err error) {
 	var ve *causality.ValidationError
 	var ce *causality.ConflictError
 	switch {
+	case errors.Is(err, causality.ErrUnavailable):
+		writeErr(w, http.StatusServiceUnavailable, "service is recovering from a persistence failure; retry after restart")
 	case errors.Is(err, causality.ErrRoundNotFound):
 		writeErr(w, http.StatusNotFound, err.Error())
 	case errors.As(err, &ve):

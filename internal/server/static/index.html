@@ -54,7 +54,8 @@
     <label>阀门（逗号分隔，可用 名称=初始状态，默认 closed）</label>
     <input id="f-valves" placeholder="GV1=closed,GV2" value="GV1=closed,GV2=closed">
     <button class="primary" onclick="createRound()">建立轮次</button>
-    <div class="hint">已建轮次：<span id="round-list" class="muted">—</span></div>
+    <div class="hint">已建轮次（点击打开，重启后状态已恢复）：<span id="round-list" class="muted">—</span></div>
+    <div class="hint">当前轮次：<span id="current-round" class="muted">—</span></div>
   </section>
 
   <section>
@@ -133,19 +134,34 @@ async function createRound() {
   const id = $('f-round-id').value.trim(); if (id) body.id = id;
   const r = await api('/api/rounds', 'POST', body);
   if (r.status === 201) {
-    roundId = r.json.id;
-    banner('ok', '轮次已建立：' + roundId);
-    await refresh(); await listRounds();
-    if (timer) clearInterval(timer);
-    timer = setInterval(refresh, 1500);
+    banner('ok', '轮次已建立：' + r.json.id);
+    await openRound(r.json.id);
   } else {
     banner('bad', '建立轮次被拒绝：' + (r.json && r.json.reason || r.text));
   }
 }
 
+// 打开（或重开）一个轮次：服务重启后已恢复的阀门、前沿、等待项与
+// 裁决原因会立即呈现，可继续提交前驱放行等待链。
+async function openRound(id) {
+  roundId = id;
+  $('current-round').textContent = id;
+  if (decodeURIComponent(location.hash || '').replace(/^#/, '') !== id) {
+    history.replaceState(null, '', '#' + encodeURIComponent(id));
+  }
+  await refresh();
+  await listRounds();
+  if (timer) clearInterval(timer);
+  timer = setInterval(refresh, 1500);
+}
+
 async function listRounds() {
   const r = await api('/api/rounds');
-  $('round-list').textContent = (r.json && r.json.rounds || []).join(', ') || '—';
+  const rounds = (r.json && r.json.rounds) || [];
+  $('round-list').innerHTML = rounds.length
+    ? rounds.map(id => `<a href="#" style="color:var(--acc)"
+        onclick="openRound(this.textContent);return false">${esc(id)}</a>`).join(', ')
+    : '—';
 }
 
 async function refresh() {
@@ -244,7 +260,13 @@ async function submitEvent() {
   await refresh();
 }
 
-listRounds();
+// 页面打开（含服务重启后重开）：列出已恢复的轮次；若 URL 带 #轮次id
+//（例如值班员书签 /#rec）则立即重开该轮次并呈现恢复后的状态。
+(async () => {
+  await listRounds();
+  const id = decodeURIComponent(location.hash || '').replace(/^#/, '');
+  if (id) await openRound(id);
+})();
 </script>
 </body>
 </html>

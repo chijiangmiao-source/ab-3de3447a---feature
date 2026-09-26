@@ -5,6 +5,10 @@
 **2–5 个控制台**和若干阀门的轮次。页面经真实 HTTP 接口提交事件并实时呈现
 阀门状态、因果前沿、等待项与放行/拒绝原因。
 
+全部因果状态写入 **WAL（预写日志）并 fsync**，进程退出或容器重建后按日志
+**校验恢复**：成功响应只在对应完整状态落盘后返回；截断/损坏的日志尾部被
+回退到最后一致状态，轮次保留且可继续操作。
+
 ## 语义模型
 
 - **事件**：`event_id`（唯一标识）、`console`、`seq`（控制台本地序号）、
@@ -23,14 +27,36 @@
 ## 运行
 
 ```bash
-# 启动服务（宿主端口可配置，默认 8080）
+# 启动服务（宿主端口可配置，默认 8080；数据目录可配置，默认 /data）
 docker compose up --build app
 APP_HOST_PORT=9090 docker compose up --build app
+
+# 直接用二进制：DATA_DIR 为 WAL 数据目录
+DATA_DIR=./interlock-data LISTEN_ADDR=:8080 ./app
 
 # 健康入口与页面
 curl http://localhost:8080/healthz        # {"status":"ok"}
 open http://localhost:8080/               # 控制台页面
+open http://localhost:8080/#rec           # 直接重开已恢复的轮次 rec
 ```
+
+## 持久化与恢复
+
+- **落盘时机**：建立轮次写 `created` 帧；事件被判为等待写 `accepted` 帧；
+  事件被消费时，触发事件与本次级联放行的全部裁决（含 `rejected_stale`）
+  作为**一个原子批次**写 `committed` 帧。每次追加都 `write + fsync`
+  （建轮次还 fsync 目录），**成功 HTTP 响应只在落盘成功后返回**。
+- **WAL 帧**：每帧 `magic | length | kind | JSON 载荷 | SHA-256 校验和`，
+  每个轮次一个 `<id>-<hash>.wal` 文件（hash 防止 id 路径穿越/碰撞）。
+- **启动校验**：逐帧核对 magic、长度、校验和，并把每帧交给引擎按当前
+  因果状态重算（批次先在克隆上整体验证，不全部成立则整批拒绝），**只接纳
+  可证明完整且与引擎重算一致的提交**。
+- **尾部回退**：截断、校验和损坏或语义对不上的第一帧起全部丢弃，并把文件
+  物理截断到最后一致偏移（随后 fsync 文件与目录）；**轮次保留，仍可继续
+  提交事件**。写盘失败时引擎进入 fatal：`/healthz` 返回 `503`、写接口
+  返回 `503`，等待容器监督重启后从数据目录恢复，避免内存/磁盘状态分叉。
+- **不重复裁决**：未完成的 `committed` 帧回滚后，触发事件可原样重投；已落盘
+  的 `accepted`（等待）与已裁决事件重投一律返回**原结论**，不会二次消费。
 
 ## 验收（verify）
 
@@ -42,14 +68,24 @@ echo $?   # 0 = 验收通过
 `verify` 容器依次执行并以退出码报告结果：
 
 1. **构建检查** `go build ./...` 与静态检查 `go vet ./...`；
-2. **代码测试** `go test ./...`（引擎与 API 层单元测试）；
-3. **因果场景 HTTP 冒烟**（`cmd/verify`）：
+2. **代码测试** `go test ./...`（引擎、WAL 存储、API 层单元测试）；
+3. **因果场景 HTTP 冒烟**（`cmd/verify`，对 `app` 容器）：
    - 依赖另一控制台的事件先到达 → 显示等待；补齐前驱 → 连续放行；
    - 两控制台争用同一旧状态 → 较小事件标识成功，另一项稳定预条件拒绝；
    - 竞争失败方的后继事件不被拒绝结果阻塞；
    - 同一事件重投返回既有结论；标识复用载荷变化/跳号/未知控制台/未来依赖
      均被明确拒绝且阀门状态不变；
    - 健康入口与业务接口响应可观察。
+4. **崩溃恢复冒烟**（`cmd/verify -restart`，在**可配置数据目录**
+   `RESTART_DATA_DIR` 上管理自己的 app 子进程）：
+   - 建轮次后制造已放行、已预条件拒绝与一个等待项；
+   - **SIGKILL 杀进程**（模拟进程退出/容器重建，无优雅刷盘）→ 同目录重启，
+     经 HTTP 验证阀门、前沿、等待项（含缺失依赖）与裁决原因完整恢复，
+     `/healthz`、`/`、轮次接口持续可用；
+   - 已放行/已拒绝标识重投 → 原结论；复用标识改载荷 → `409`；
+   - 重启后补交争用方与前驱，跨重启同批按稳定标识顺序裁决，败方后继不阻塞；
+   - 再次杀进程并**损坏 WAL 尾部** → 重启回退到最后一致状态、轮次可继续操作，
+     第三次重启状态仍一致。
 
 ## HTTP API
 
@@ -59,7 +95,7 @@ echo $?   # 0 = 验收通过
 | GET | `/` | 控制台页面 |
 | POST | `/api/rounds` | 建立轮次：`{"id"?, "consoles":[2..5], "valves":{"GV1":"closed"}}` → `201` |
 | GET | `/api/rounds` / `/api/rounds/{id}` | 轮次列表 / 状态（阀门、前沿、等待项、裁决记录） |
-| POST | `/api/rounds/{id}/events` | 提交事件 → `200`(applied/rejected) / `202`(waiting) / `400` / `404` / `409` |
+| POST | `/api/rounds/{id}/events` | 提交事件 → `200`(applied/rejected) / `202`(waiting) / `400` / `404` / `409`；持久化故障时 `503`（健康入口同时转为 503，等待重启恢复） |
 
 事件提交示例：
 
@@ -80,9 +116,10 @@ echo $?   # 0 = 验收通过
 ## 结构
 
 ```
-cmd/app        服务入口（LISTEN_ADDR，默认 :8080）
-cmd/verify     验收冒烟程序（APP_URL，退出码报告结果）
-internal/causality  因果引擎：前沿、依赖向量、原子消费、级联、稳定裁决、幂等
+cmd/app        服务入口（LISTEN_ADDR 默认 :8080，DATA_DIR 默认 ./data；启动时校验恢复）
+cmd/verify     验收冒烟程序（APP_URL；-restart 子进程崩溃恢复套件：APP_BIN / RESTART_DATA_DIR / RESTART_LISTEN）
+internal/causality  因果引擎：前沿、依赖向量、原子消费、级联、稳定裁决、幂等、WAL 帧重放校验
+internal/store      WAL 存储：帧编码/校验和、fsync 写穿、逐帧恢复、损坏尾部截断回退
 internal/server     HTTP API + 内嵌控制台页面
-scripts/verify-entry.sh  verify 容器入口：构建检查 → 测试 → 冒烟
+scripts/verify-entry.sh  verify 容器入口：构建检查 → 测试 → HTTP 冒烟 → 崩溃恢复冒烟
 ```

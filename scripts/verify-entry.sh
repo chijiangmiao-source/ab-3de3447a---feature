@@ -1,6 +1,6 @@
 #!/bin/sh
-# verify 入口：构建检查 → 代码测试 → 因果场景 HTTP 冒烟。
-# 任一步骤失败即非零退出；全部通过则冒烟程序的退出码决定验收结果。
+# verify 入口：构建检查 → 代码测试 → 因果场景 HTTP 冒烟 → 崩溃恢复冒烟。
+# 任一步骤失败即非零退出；全部通过则验收通过。
 set -eu
 
 # 服务以纯静态二进制构建，检查保持一致，避免依赖 C 工具链。
@@ -16,4 +16,11 @@ echo "[verify] 代码测试: go test ./..."
 go test -buildvcs=false ./...
 
 echo "[verify] HTTP 冒烟: APP_URL=${APP_URL:-http://localhost:8080}"
-exec verify-smoke
+verify-smoke
+
+echo "[verify] 崩溃恢复冒烟: APP_BIN=${APP_BIN:-/usr/local/bin/app} RESTART_DATA_DIR=${RESTART_DATA_DIR:-/tmp/interlock-restart-data}"
+# 在可配置数据目录上启动应用，SIGKILL 模拟进程退出/容器重建，
+# 重启后经 HTTP 重放等待项、前沿、裁决与幂等场景，并验证损坏尾部回退。
+verify-smoke -restart
+
+echo "[verify] 全部验收通过"

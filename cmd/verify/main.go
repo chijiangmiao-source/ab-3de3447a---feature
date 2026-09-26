@@ -7,6 +7,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -167,11 +168,24 @@ func main() {
 	if v := os.Getenv("APP_URL"); v != "" {
 		baseURL = strings.TrimRight(v, "/")
 	}
+	var restart bool
+	flag.BoolVar(&restart, "restart", false, "run the kill/restart recovery suite (manages its own app subprocess)")
+	flag.Parse()
+	if restart {
+		runRestartSuite()
+		return
+	}
+	runRemoteSuite()
+}
+
+func runRemoteSuite() {
 	fmt.Printf("[verify] waiting for service at %s ...\n", baseURL)
 	if err := waitHealthy(); err != nil {
 		fmt.Println("FAIL  health endpoint:", err)
 		os.Exit(1)
 	}
+	// 服务是持久化的：验收轮次使用唯一 id，重复运行验收不会撞上既有轮次。
+	roundID := fmt.Sprintf("acceptance-%d", time.Now().UnixNano())
 
 	fmt.Println("[1] 健康入口与页面")
 	code, err := doJSON("GET", "/healthz", nil, nil)
@@ -189,7 +203,7 @@ func main() {
 	fmt.Println("[2] 建立轮次（3 控制台 + 2 阀门）")
 	var created roundView
 	code, err = doJSON("POST", "/api/rounds", map[string]any{
-		"id":       "acceptance",
+		"id":       roundID,
 		"consoles": []string{"alpha", "beta", "gamma"},
 		"valves":   map[string]string{"GV1": "closed", "GV2": "closed"},
 	}, &created)
@@ -201,16 +215,16 @@ func main() {
 	b1 := event{EventID: "acc-b-001", Console: "beta", Seq: 1,
 		Deps:  map[string]int{"alpha": 1, "beta": 0, "gamma": 0},
 		Valve: "GV1", Expected: "closed", NewState: "open"}
-	code, out, err := submit("acceptance", b1)
+	code, out, err := submit(roundID, b1)
 	check("acc-b-001 → 202 waiting", err == nil && code == 202 && out.Status == "waiting",
 		fmt.Sprintf("code=%d status=%s err=%v", code, out.Status, err))
 	check("等待原因指出缺失 alpha", strings.Contains(out.Reason, "alpha"), out.Reason)
-	st, err := getRound("acceptance")
+	st, err := getRound(roundID)
 	check("等待项可见且缺失依赖为 alpha>=1", err == nil && len(st.Pending) == 1 && st.Pending[0].Missing["alpha"] == 1,
 		fmt.Sprintf("%+v", st.Pending))
 	check("等待期间阀门与前沿不变", st.Valves["GV1"] == "closed" && st.Frontier["beta"] == 0,
 		fmt.Sprintf("valves=%+v frontier=%+v", st.Valves, st.Frontier))
-	code, out, _ = submit("acceptance", b1)
+	code, out, _ = submit(roundID, b1)
 	check("等待中重投同一事件 → 仍为 waiting", code == 202 && out.Status == "waiting",
 		fmt.Sprintf("code=%d status=%s", code, out.Status))
 
@@ -218,7 +232,7 @@ func main() {
 	a1 := event{EventID: "acc-a-001", Console: "alpha", Seq: 1,
 		Deps:  map[string]int{"alpha": 0, "beta": 0, "gamma": 0},
 		Valve: "GV2", Expected: "closed", NewState: "open"}
-	code, out, err = submit("acceptance", a1)
+	code, out, err = submit(roundID, a1)
 	check("acc-a-001 → 200 applied", err == nil && code == 200 && out.Status == "applied",
 		fmt.Sprintf("code=%d status=%s", code, out.Status))
 	check("级联放行 acc-b-001（GV1 已打开）", out.Round != nil && out.Round.Valves["GV1"] == "open",
@@ -228,10 +242,10 @@ func main() {
 	check("等待项清空", out.Round != nil && len(out.Round.Pending) == 0)
 	cascaded := findLog(*out.Round, "acc-b-001")
 	check("裁决记录中 acc-b-001 为 applied", cascaded != nil && cascaded.Status == "applied")
-	code, out, _ = submit("acceptance", b1)
+	code, out, _ = submit(roundID, b1)
 	check("放行后重投 acc-b-001 → 返回既有结论 applied", code == 200 && out.Status == "applied",
 		fmt.Sprintf("code=%d status=%s", code, out.Status))
-	st, _ = getRound("acceptance")
+	st, _ = getRound(roundID)
 	check("重投未造成重复消费", countLog(st, "acc-b-001") == 1, fmt.Sprintf("log entries=%d", countLog(st, "acc-b-001")))
 
 	fmt.Println("[5] 并发争用同一旧状态 → 较小事件标识成功")
@@ -241,17 +255,17 @@ func main() {
 	b2 := event{EventID: "acc-b-010", Console: "beta", Seq: 2,
 		Deps:  map[string]int{"alpha": 1, "beta": 1, "gamma": 1},
 		Valve: "GV2", Expected: "open", NewState: "closed"}
-	code, out, _ = submit("acceptance", a2)
+	code, out, _ = submit(roundID, a2)
 	check("acc-a-010 等待 gamma 前驱", code == 202 && out.Status == "waiting", out.Status)
-	code, out, _ = submit("acceptance", b2)
+	code, out, _ = submit(roundID, b2)
 	check("acc-b-010 等待 gamma 前驱", code == 202 && out.Status == "waiting", out.Status)
 	g1 := event{EventID: "acc-g-001", Console: "gamma", Seq: 1,
 		Deps:  map[string]int{"gamma": 0},
 		Valve: "GV1", Expected: "open", NewState: "closed"}
-	code, out, err = submit("acceptance", g1)
+	code, out, err = submit(roundID, g1)
 	check("acc-g-001 → applied", err == nil && code == 200 && out.Status == "applied",
 		fmt.Sprintf("code=%d status=%s", code, out.Status))
-	st, _ = getRound("acceptance")
+	st, _ = getRound(roundID)
 	recA, recB := findLog(st, "acc-a-010"), findLog(st, "acc-b-010")
 	check("较小标识 acc-a-010 放行", recA != nil && recA.Status == "applied",
 		fmt.Sprintf("acc-a-010=%v", recA))
@@ -261,13 +275,13 @@ func main() {
 	check("败方因果位置同样推进 beta=2", st.Frontier["beta"] == 2, fmt.Sprintf("%+v", st.Frontier))
 
 	fmt.Println("[6] 竞争事件的后继不被拒绝结果阻塞")
-	code, out, _ = submit("acceptance", b2)
+	code, out, _ = submit(roundID, b2)
 	check("重投 acc-b-010 → 稳定返回预条件拒绝", code == 200 && out.Status == "rejected_precondition",
 		fmt.Sprintf("code=%d status=%s", code, out.Status))
 	b3 := event{EventID: "acc-b-020", Console: "beta", Seq: 3,
 		Deps:  map[string]int{"alpha": 2, "beta": 2, "gamma": 1},
 		Valve: "GV1", Expected: "closed", NewState: "open"}
-	code, out, err = submit("acceptance", b3)
+	code, out, err = submit(roundID, b3)
 	check("beta 后继 acc-b-020 → applied", err == nil && code == 200 && out.Status == "applied",
 		fmt.Sprintf("code=%d status=%s", code, out.Status))
 	check("GV1 重新打开", out.Round != nil && out.Round.Valves["GV1"] == "open")
@@ -275,44 +289,44 @@ func main() {
 	fmt.Println("[7] 拒绝类别（均不得改变阀门状态）")
 	reuse := a1
 	reuse.Valve = "GV1" // 同一标识 acc-a-001，载荷变化
-	code, eout, _ := submitErr("acceptance", reuse)
+	code, eout, _ := submitErr(roundID, reuse)
 	check("标识复用而载荷变化 → 409", code == 409 && strings.Contains(eout.Reason, "different payload"),
 		fmt.Sprintf("code=%d reason=%s", code, eout.Reason))
 	gap := event{EventID: "acc-a-100", Console: "alpha", Seq: 5, Deps: map[string]int{},
 		Valve: "GV1", Expected: "open", NewState: "closed"}
-	code, eout, _ = submitErr("acceptance", gap)
+	code, eout, _ = submitErr(roundID, gap)
 	check("跳号 → 400 且说明期望序号", code == 400 && strings.Contains(eout.Reason, "gap"),
 		fmt.Sprintf("code=%d reason=%s", code, eout.Reason))
 	stale := event{EventID: "acc-a-101", Console: "alpha", Seq: 1, Deps: map[string]int{},
 		Valve: "GV1", Expected: "open", NewState: "closed"}
-	code, eout, _ = submitErr("acceptance", stale)
+	code, eout, _ = submitErr(roundID, stale)
 	check("过期序号 → 400", code == 400 && strings.Contains(eout.Reason, "stale"),
 		fmt.Sprintf("code=%d reason=%s", code, eout.Reason))
 	ghost := event{EventID: "acc-x-001", Console: "delta", Seq: 1, Deps: map[string]int{},
 		Valve: "GV1", Expected: "open", NewState: "closed"}
-	code, eout, _ = submitErr("acceptance", ghost)
+	code, eout, _ = submitErr(roundID, ghost)
 	check("未知控制台 → 400", code == 400 && strings.Contains(eout.Reason, "unknown console"),
 		fmt.Sprintf("code=%d reason=%s", code, eout.Reason))
 	future := event{EventID: "acc-a-102", Console: "alpha", Seq: 3,
 		Deps: map[string]int{"alpha": 3}, Valve: "GV1", Expected: "open", NewState: "closed"}
-	code, eout, _ = submitErr("acceptance", future)
+	code, eout, _ = submitErr(roundID, future)
 	check("未来依赖（依赖自身未来序号）→ 400", code == 400 && strings.Contains(eout.Reason, "future dependency"),
 		fmt.Sprintf("code=%d reason=%s", code, eout.Reason))
 	ghostDep := event{EventID: "acc-a-103", Console: "alpha", Seq: 3,
 		Deps: map[string]int{"delta": 1}, Valve: "GV1", Expected: "open", NewState: "closed"}
-	code, eout, _ = submitErr("acceptance", ghostDep)
+	code, eout, _ = submitErr(roundID, ghostDep)
 	check("依赖未知控制台 → 400", code == 400 && strings.Contains(eout.Reason, "unknown console"),
 		fmt.Sprintf("code=%d reason=%s", code, eout.Reason))
 	badValve := event{EventID: "acc-a-104", Console: "alpha", Seq: 3, Deps: map[string]int{},
 		Valve: "GVX", Expected: "open", NewState: "closed"}
-	code, eout, _ = submitErr("acceptance", badValve)
+	code, eout, _ = submitErr(roundID, badValve)
 	check("未知阀门 → 400", code == 400 && strings.Contains(eout.Reason, "unknown valve"),
 		fmt.Sprintf("code=%d reason=%s", code, eout.Reason))
 	code, _, _ = submitErr("no-such-round", a1)
 	check("未知轮次 → 404", code == 404, fmt.Sprintf("code=%d", code))
 
 	fmt.Println("[8] 最终因果状态可观察且未被拒绝操作污染")
-	st, err = getRound("acceptance")
+	st, err = getRound(roundID)
 	check("GET /api/rounds/acceptance → 200", err == nil, fmt.Sprint(err))
 	check("前沿 alpha=2,beta=3,gamma=1",
 		st.Frontier["alpha"] == 2 && st.Frontier["beta"] == 3 && st.Frontier["gamma"] == 1,

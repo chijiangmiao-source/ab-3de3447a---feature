@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -162,3 +163,46 @@ func TestAPIFlow(t *testing.T) {
 		t.Fatalf("valve state observable via API: %v", view["valves"])
 	}
 }
+
+// 持久化失败后：健康入口 503（容器监督据此重启），写接口 503。
+func TestUnavailableAfterPersistenceFailure(t *testing.T) {
+	eng := causality.NewPersistentEngine(&failingStore{})
+	srv := httptest.NewServer(New(eng))
+	defer srv.Close()
+
+	// 第一次写入触发持久化失败，引擎进入 fatal
+	code, _ := post(t, srv.URL+"/api/rounds", map[string]any{
+		"id": "r1", "consoles": []string{"a", "b"}, "valves": map[string]string{"V": "closed"},
+	})
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("first create must surface the persistence failure as 503, got %d", code)
+	}
+
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("health must be 503 after persistence failure, got %d", resp.StatusCode)
+	}
+
+	code, _ = post(t, srv.URL+"/api/rounds", map[string]any{
+		"id": "r2", "consoles": []string{"a", "b"}, "valves": map[string]string{"V": "closed"},
+	})
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("create round must be 503 after persistence failure, got %d", code)
+	}
+}
+
+type failingStore struct{}
+
+func (failingStore) AppendCreated(causality.RoundCreated) error { return errDisk }
+func (failingStore) AppendAccepted(string, causality.Event) error {
+	return errDisk
+}
+func (failingStore) AppendCommitted(string, []causality.CommittedEntry) error {
+	return errDisk
+}
+
+var errDisk = errors.New("disk on fire")

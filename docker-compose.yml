@@ -7,11 +7,19 @@ services:
     image: vacuum-interlock-app
     environment:
       LISTEN_ADDR: ":8080"
+      # 数据目录可配置：轮次、等待项与裁决全部经 WAL 持久化于此，
+      # 进程退出/容器重建后从该目录恢复（损坏尾部回退到最后一致状态）。
+      DATA_DIR: /data
+    volumes:
+      # 命名卷可换成宿主目录，如 - ./interlock-data:/data
+      - interlock-data:/data
     ports:
       # 宿主端口可配置：APP_HOST_PORT=9090 docker compose up app
       - "${APP_HOST_PORT:-8080}:8080"
 
-  # 验收：构建检查 + 代码测试 + 因果场景 HTTP 冒烟，执行后退出并以退出码报告结果。
+  # 验收：构建检查 + 代码测试 + 因果场景 HTTP 冒烟 + 崩溃恢复冒烟
+  # （在可配置数据目录上 SIGKILL/重启应用并经 HTTP 重放全部场景），
+  # 执行后退出并以退出码报告结果。
   # 用法：docker compose up --build --exit-code-from verify --abort-on-container-exit
   verify:
     build:
@@ -22,3 +30,9 @@ services:
       - app
     environment:
       APP_URL: http://app:8080
+      APP_BIN: /usr/local/bin/app
+      # 恢复冒烟使用的数据目录（verify 容器内，可配置）
+      RESTART_DATA_DIR: /tmp/interlock-restart-data
+
+volumes:
+  interlock-data:
