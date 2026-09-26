@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>同步辐射真空阀联锁 · 因果一致性控制台</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --dim:#8b949e;
+          --ok:#3fb950; --wait:#d29922; --bad:#f85149; --acc:#58a6ff; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 "SF Mono",Consolas,"Courier New",monospace; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:17px; }
+  header .sub { color:var(--dim); font-size:12px; margin-top:2px; }
+  main { display:grid; gap:16px; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); padding:16px 20px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
+  h2 { margin:0 0 10px; font-size:13px; color:var(--acc); text-transform:uppercase; letter-spacing:.06em; }
+  label { display:block; color:var(--dim); font-size:12px; margin:8px 0 3px; }
+  input,select,button { font:inherit; background:#0d1117; color:var(--fg); border:1px solid var(--line);
+         border-radius:6px; padding:6px 8px; width:100%; }
+  button { width:auto; cursor:pointer; background:#21262d; margin-top:10px; }
+  button:hover { border-color:var(--acc); }
+  button.primary { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+  .row { display:flex; gap:8px; } .row>* { flex:1; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th,td { text-align:left; padding:5px 7px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:normal; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11.5px; white-space:nowrap; }
+  .b-applied { background:rgba(63,185,80,.15); color:var(--ok); border:1px solid var(--ok); }
+  .b-waiting { background:rgba(210,153,34,.15); color:var(--wait); border:1px solid var(--wait); }
+  .b-rejected,.b-rejected_precondition,.b-rejected_stale { background:rgba(248,81,73,.12); color:var(--bad); border:1px solid var(--bad); }
+  .reason { color:var(--dim); font-size:12px; }
+  #banner { display:none; margin:0 20px; padding:10px 14px; border-radius:8px; border:1px solid var(--line); }
+  #banner.show { display:block; }
+  .muted { color:var(--dim); } .mono { font-family:inherit; }
+  .deps-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:6px; }
+  .hint { font-size:11.5px; color:var(--dim); margin-top:4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>同步辐射真空阀联锁 · 因果一致性控制台</h1>
+  <div class="sub">离线提交 → 恢复联网后按因果前沿与依赖向量原子裁决；到达顺序不改变因果状态</div>
+</header>
+<div id="banner"></div>
+<main>
+  <section>
+    <h2>① 建立轮次（值班员）</h2>
+    <label>轮次 ID（留空自动生成）</label>
+    <input id="f-round-id" placeholder="round-1">
+    <label>控制台（逗号分隔，2–5 个）</label>
+    <input id="f-consoles" placeholder="alpha,beta,gamma" value="alpha,beta,gamma">
+    <label>阀门（逗号分隔，可用 名称=初始状态，默认 closed）</label>
+    <input id="f-valves" placeholder="GV1=closed,GV2" value="GV1=closed,GV2=closed">
+    <button class="primary" onclick="createRound()">建立轮次</button>
+    <div class="hint">已建轮次：<span id="round-list" class="muted">—</span></div>
+  </section>
+
+  <section>
+    <h2>② 提交联锁事件（真实接口）</h2>
+    <label>事件标识（唯一）</label>
+    <div class="row">
+      <input id="f-event-id">
+      <button style="flex:0 0 auto;margin-top:0" onclick="genEventID()">随机</button>
+    </div>
+    <div class="row">
+      <div><label>控制台</label><select id="f-console" onchange="prefill()"></select></div>
+      <div><label>本地序号</label><input id="f-seq" type="number" min="1" value="1"></div>
+    </div>
+    <label>完整依赖向量（各控制台已消费序号）</label>
+    <div class="deps-grid" id="f-deps"></div>
+    <div class="row">
+      <div><label>目标阀门</label><select id="f-valve" onchange="prefillExpected()"></select></div>
+      <div><label>期望旧状态</label><input id="f-expected" placeholder="closed"></div>
+      <div><label>新状态</label><input id="f-newstate" placeholder="open"></div>
+    </div>
+    <button class="primary" onclick="submitEvent()">提交事件</button>
+    <button onclick="fillDepsFromFrontier()">依赖按当前前沿填充</button>
+  </section>
+
+  <section>
+    <h2>③ 阀门状态</h2>
+    <table id="t-valves"><thead><tr><th>阀门</th><th>当前状态</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section>
+    <h2>④ 因果前沿</h2>
+    <table id="t-frontier"><thead><tr><th>控制台</th><th>已消费序号</th><th>下一期望序号</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section>
+    <h2>⑤ 等待项（依赖未满足）</h2>
+    <table id="t-pending"><thead><tr><th>事件</th><th>位置</th><th>缺失依赖</th></tr></thead><tbody></tbody></table>
+  </section>
+
+  <section>
+    <h2>⑥ 事件裁决记录（放行 / 拒绝原因）</h2>
+    <table id="t-log"><thead><tr><th>事件</th><th>位置</th><th>阀门</th><th>裁决</th><th>原因</th></tr></thead><tbody></tbody></table>
+  </section>
+</main>
+
+<script>
+let roundId = null, view = null, timer = null;
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, ch =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+
+async function api(path, method = 'GET', body = null) {
+  const opt = { method, headers: {} };
+  if (body) { opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  const res = await fetch(path, opt);
+  const text = await res.text();
+  let json = null; try { json = JSON.parse(text); } catch (e) {}
+  return { status: res.status, json, text };
+}
+
+function banner(kind, msg) {
+  const b = $('banner');
+  b.className = 'show';
+  b.style.borderColor = kind === 'ok' ? 'var(--ok)' : kind === 'wait' ? 'var(--wait)' : 'var(--bad)';
+  b.textContent = msg;
+}
+
+async function createRound() {
+  const consoles = $('f-consoles').value.split(',').map(s => s.trim()).filter(Boolean);
+  const valves = {};
+  $('f-valves').value.split(',').map(s => s.trim()).filter(Boolean).forEach(p => {
+    const [name, st] = p.split('=').map(x => x.trim());
+    if (name) valves[name] = st || 'closed';
+  });
+  const body = { consoles, valves };
+  const id = $('f-round-id').value.trim(); if (id) body.id = id;
+  const r = await api('/api/rounds', 'POST', body);
+  if (r.status === 201) {
+    roundId = r.json.id;
+    banner('ok', '轮次已建立：' + roundId);
+    await refresh(); await listRounds();
+    if (timer) clearInterval(timer);
+    timer = setInterval(refresh, 1500);
+  } else {
+    banner('bad', '建立轮次被拒绝：' + (r.json && r.json.reason || r.text));
+  }
+}
+
+async function listRounds() {
+  const r = await api('/api/rounds');
+  $('round-list').textContent = (r.json && r.json.rounds || []).join(', ') || '—';
+}
+
+async function refresh() {
+  if (!roundId) return;
+  const r = await api('/api/rounds/' + encodeURIComponent(roundId));
+  if (r.status !== 200) return;
+  view = r.json;
+  render();
+}
+
+function render() {
+  // 阀门状态
+  $('t-valves').querySelector('tbody').innerHTML = Object.entries(view.valves)
+    .sort().map(([k, v]) => `<tr><td>${esc(k)}</td><td><b>${esc(v)}</b></td></tr>`).join('');
+  // 因果前沿
+  $('t-frontier').querySelector('tbody').innerHTML = view.consoles
+    .map(c => `<tr><td>${esc(c)}</td><td>${view.frontier[c]}</td><td>${view.frontier[c] + 1}</td></tr>`).join('');
+  // 等待项
+  $('t-pending').querySelector('tbody').innerHTML = view.pending.length
+    ? view.pending.map(p => `<tr><td>${esc(p.event.event_id)}</td>
+        <td>${esc(p.event.console)}#${p.event.seq}</td>
+        <td class="reason">${esc(Object.entries(p.missing).map(([c, s]) => c + '>=' + s).join(', '))}</td></tr>`).join('')
+    : '<tr><td colspan="3" class="muted">无等待项</td></tr>';
+  // 裁决记录
+  $('t-log').querySelector('tbody').innerHTML = view.log.length
+    ? view.log.map(rec => `<tr><td>${esc(rec.event.event_id)}</td>
+        <td>${esc(rec.event.console)}#${rec.event.seq}</td>
+        <td>${esc(rec.event.valve)}</td>
+        <td><span class="badge b-${rec.status}">${esc(rec.status)}</span></td>
+        <td class="reason">${esc(rec.reason || '')}</td></tr>`).join('')
+    : '<tr><td colspan="5" class="muted">暂无记录</td></tr>';
+  // 表单选项
+  syncSelect('f-console', view.consoles);
+  syncSelect('f-valve', Object.keys(view.valves).sort());
+  buildDepsInputs();
+}
+
+function syncSelect(id, options) {
+  const el = $(id), cur = el.value;
+  el.innerHTML = options.map(o => `<option ${o === cur ? 'selected' : ''}>${esc(o)}</option>`).join('');
+  if (!cur && options.length) el.value = options[0];
+}
+
+function buildDepsInputs(force) {
+  const box = $('f-deps');
+  const keep = {};
+  box.querySelectorAll('input').forEach(i => keep[i.dataset.c] = i.value);
+  box.innerHTML = view.consoles.map(c =>
+    `<div><label>${esc(c)}</label><input data-c="${esc(c)}" type="number" min="0"
+       value="${!force && keep[c] !== undefined ? keep[c] : view.frontier[c]}"></div>`).join('');
+}
+
+function fillDepsFromFrontier() { if (view) buildDepsInputs(true); }
+
+function prefill() {
+  if (!view) return;
+  const c = $('f-console').value;
+  $('f-seq').value = (view.frontier[c] || 0) + 1;
+  prefillExpected(); genEventID();
+}
+
+function prefillExpected() {
+  if (!view) return;
+  $('f-expected').value = view.valves[$('f-valve').value] || '';
+}
+
+function genEventID() {
+  const c = $('f-console').value || 'console';
+  const s = $('f-seq').value || '1';
+  $('f-event-id').value = `evt-${c}-${s}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+async function submitEvent() {
+  if (!roundId) { banner('bad', '请先建立轮次'); return; }
+  const deps = {};
+  $('f-deps').querySelectorAll('input').forEach(i => deps[i.dataset.c] = parseInt(i.value || '0', 10));
+  const ev = {
+    event_id: $('f-event-id').value.trim(),
+    console: $('f-console').value,
+    seq: parseInt($('f-seq').value, 10),
+    deps,
+    valve: $('f-valve').value,
+    expected_old: $('f-expected').value.trim(),
+    new_state: $('f-newstate').value.trim()
+  };
+  const r = await api('/api/rounds/' + encodeURIComponent(roundId) + '/events', 'POST', ev);
+  const j = r.json || {};
+  if (r.status === 200 || r.status === 202) {
+    banner(j.status === 'applied' ? 'ok' : j.status === 'waiting' ? 'wait' : 'bad',
+      `${j.event_id} → ${j.status}：${j.reason || ''}`);
+    if (j.round) { view = j.round; render(); }
+    genEventID();
+  } else {
+    banner('bad', `${ev.event_id} → rejected（${r.status}）：${j.reason || r.text}`);
+  }
+  await refresh();
+}
+
+listRounds();
+</script>
+</body>
+</html>

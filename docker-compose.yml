@@ -1,0 +1,24 @@
+# 同步辐射真空阀联锁 · 因果一致性服务与验收
+services:
+  app:
+    build:
+      context: .
+      target: app
+    image: vacuum-interlock-app
+    environment:
+      LISTEN_ADDR: ":8080"
+    ports:
+      # 宿主端口可配置：APP_HOST_PORT=9090 docker compose up app
+      - "${APP_HOST_PORT:-8080}:8080"
+
+  # 验收：构建检查 + 代码测试 + 因果场景 HTTP 冒烟，执行后退出并以退出码报告结果。
+  # 用法：docker compose up --build --exit-code-from verify --abort-on-container-exit
+  verify:
+    build:
+      context: .
+      target: verify
+    image: vacuum-interlock-verify
+    depends_on:
+      - app
+    environment:
+      APP_URL: http://app:8080
