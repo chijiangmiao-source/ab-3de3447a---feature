@@ -162,3 +162,78 @@ func TestAPIFlow(t *testing.T) {
 		t.Fatalf("valve state observable via API: %v", view["valves"])
 	}
 }
+
+// 进程重启后，轮次的阀门、前沿、等待项与裁决原因经 HTTP 完整重现，
+// 补交前驱后等待链继续放行。
+func TestHTTPStateSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	eng, err := causality.OpenEngine(dir)
+	if err != nil {
+		t.Fatalf("open engine: %v", err)
+	}
+	srv := httptest.NewServer(New(eng))
+
+	code, out := post(t, srv.URL+"/api/rounds", map[string]any{
+		"id":       "rr",
+		"consoles": []string{"alpha", "beta"},
+		"valves":   map[string]string{"GV1": "closed", "GV2": "closed"},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create round: %d %v", code, out)
+	}
+	waiting := map[string]any{
+		"event_id": "w1", "console": "beta", "seq": 1,
+		"deps": map[string]int{"alpha": 1}, "valve": "GV1",
+		"expected_old": "closed", "new_state": "open",
+	}
+	code, out = post(t, srv.URL+"/api/rounds/rr/events", waiting)
+	if code != http.StatusAccepted {
+		t.Fatalf("waiting event: %d %v", code, out)
+	}
+	srv.Close()
+	if err := eng.Close(); err != nil {
+		t.Fatalf("close engine: %v", err)
+	}
+
+	// 进程重启：从同一数据目录恢复
+	eng2, err := causality.OpenEngine(dir)
+	if err != nil {
+		t.Fatalf("reopen engine: %v", err)
+	}
+	t.Cleanup(func() { eng2.Close() })
+	srv2 := httptest.NewServer(New(eng2))
+	defer srv2.Close()
+
+	resp, err := http.Get(srv2.URL + "/api/rounds/rr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var view map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&view)
+	resp.Body.Close()
+	if len(view["pending"].([]any)) != 1 {
+		t.Fatalf("waiting item must survive the restart: %v", view["pending"])
+	}
+	if view["frontier"].(map[string]any)["beta"].(float64) != 0 {
+		t.Fatalf("frontier must survive the restart: %v", view["frontier"])
+	}
+
+	// 重投等待中的事件 → 既有结论
+	code, out = post(t, srv2.URL+"/api/rounds/rr/events", waiting)
+	if code != http.StatusAccepted || out["status"] != string(causality.StatusWaiting) {
+		t.Fatalf("replay after restart: %d %v", code, out)
+	}
+	// 补齐前驱 → 等待链在重启后继续放行
+	code, out = post(t, srv2.URL+"/api/rounds/rr/events", map[string]any{
+		"event_id": "a1", "console": "alpha", "seq": 1,
+		"deps": map[string]int{}, "valve": "GV2",
+		"expected_old": "closed", "new_state": "open",
+	})
+	if code != http.StatusOK || out["status"] != string(causality.StatusApplied) {
+		t.Fatalf("predecessor after restart: %d %v", code, out)
+	}
+	round := out["round"].(map[string]any)
+	if round["valves"].(map[string]any)["GV1"] != "open" {
+		t.Fatalf("waiting chain must release after restart: %v", round["valves"])
+	}
+}

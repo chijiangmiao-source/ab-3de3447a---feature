@@ -41,7 +41,7 @@
 <body>
 <header>
   <h1>同步辐射真空阀联锁 · 因果一致性控制台</h1>
-  <div class="sub">离线提交 → 恢复联网后按因果前沿与依赖向量原子裁决；到达顺序不改变因果状态</div>
+  <div class="sub">离线提交 → 恢复联网后按因果前沿与依赖向量原子裁决；到达顺序不改变因果状态；因果状态持久化，进程重启后自动恢复</div>
 </header>
 <div id="banner"></div>
 <main>
@@ -54,7 +54,7 @@
     <label>阀门（逗号分隔，可用 名称=初始状态，默认 closed）</label>
     <input id="f-valves" placeholder="GV1=closed,GV2" value="GV1=closed,GV2=closed">
     <button class="primary" onclick="createRound()">建立轮次</button>
-    <div class="hint">已建轮次：<span id="round-list" class="muted">—</span></div>
+    <div class="hint">已建轮次（点击重新打开）：<span id="round-list" class="muted">—</span></div>
   </section>
 
   <section>
@@ -145,7 +145,19 @@ async function createRound() {
 
 async function listRounds() {
   const r = await api('/api/rounds');
-  $('round-list').textContent = (r.json && r.json.rounds || []).join(', ') || '—';
+  const ids = (r.json && r.json.rounds) || [];
+  $('round-list').innerHTML = ids.length
+    ? ids.map(id => `<a href="#" data-id="${esc(id)}" onclick="openRound(this.dataset.id);return false">${esc(id)}</a>`).join(', ')
+    : '—';
+}
+
+// 重新打开既有轮次（例如进程重启恢复后）：拉取并渲染恢复后的完整因果状态。
+async function openRound(id) {
+  roundId = id;
+  banner('ok', '已打开轮次：' + id);
+  await refresh();
+  if (timer) clearInterval(timer);
+  timer = setInterval(refresh, 1500);
 }
 
 async function refresh() {

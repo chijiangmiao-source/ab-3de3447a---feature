@@ -11,10 +11,12 @@ COPY internal ./internal
 RUN CGO_ENABLED=0 go build -buildvcs=false -o /out/app ./cmd/app \
  && CGO_ENABLED=0 go build -buildvcs=false -o /out/verify ./cmd/verify
 
-# ---- 运行镜像：静态二进制，健康入口 /healthz ----
+# ---- 运行镜像：静态二进制，健康入口 /healthz，因果状态持久化于 DATA_DIR ----
 FROM scratch AS app
 COPY --from=build /out/app /app
 ENV LISTEN_ADDR=:8080
+# 因果状态持久化目录（提交日志 interlock.wal）；置空则退化为纯内存运行
+ENV DATA_DIR=/data
 EXPOSE 8080
 ENTRYPOINT ["/app"]
 

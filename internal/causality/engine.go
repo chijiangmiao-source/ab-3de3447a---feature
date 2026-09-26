@@ -117,13 +117,19 @@ type RoundView struct {
 
 // Engine owns all rounds; every mutation is serialized by one mutex so an
 // event consumption (frontier advance + valve update + cascade) is atomic.
+// When a commit log is attached, each accepted mutation is prepared on a
+// private copy, persisted and only then committed in memory: a successful
+// return always means the full causal state is already durable, and a
+// persistence failure leaves the previous state intact.
 type Engine struct {
 	mu     sync.Mutex
 	rounds map[string]*Round
 	seq    int
+	clog   commitLog
 }
 
-// NewEngine creates an empty engine.
+// NewEngine creates an empty, non-durable engine (state is lost when the
+// process exits). Use OpenEngine for a recoverable engine.
 func NewEngine() *Engine {
 	return &Engine{rounds: map[string]*Round{}}
 }
@@ -179,6 +185,10 @@ func (ng *Engine) CreateRound(id string, consoles []string, valves map[string]st
 	}
 	for _, c := range consoles {
 		r.frontier[c] = 0
+	}
+	// 先持久化完整因果状态，成功后才在内存中提交并允许返回成功。
+	if err := ng.persistLocked(r); err != nil {
+		return RoundView{}, err
 	}
 	ng.rounds[id] = r
 	return r.view(), nil
@@ -241,16 +251,28 @@ func (ng *Engine) Submit(roundID string, e Event) (*Record, error) {
 		return nil, &ValidationError{Reason: fmt.Sprintf("sequence gap: console %q next expected seq is %d, got %d", e.Console, next, e.Seq)}
 	}
 
+	// 在私有副本上准备变更：先持久化完整因果状态，成功后才替换内存中的
+	// 轮次。持久化失败时原状态原样保留，客户端可安全重试。
+	work := r
+	if ng.clog != nil {
+		work = r.clone()
+	}
 	rec := &Record{Event: e, fingerprint: fp}
-	r.records[e.EventID] = rec
-	if missing := r.missingDeps(e); len(missing) > 0 {
+	work.records[e.EventID] = rec
+	if missing := work.missingDeps(e); len(missing) > 0 {
 		rec.Status = StatusWaiting
 		rec.Reason = fmt.Sprintf("waiting for dependencies: %s", formatMissing(missing))
-		r.pending[e.EventID] = rec
-		return rec, nil
+		work.pending[e.EventID] = rec
+	} else {
+		work.consume(rec)
+		work.drain()
 	}
-	r.consume(rec)
-	r.drain()
+	if err := ng.persistLocked(work); err != nil {
+		return nil, err
+	}
+	if work != r {
+		ng.rounds[roundID] = work
+	}
 	return rec, nil
 }
 
